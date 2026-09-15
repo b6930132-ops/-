@@ -57,6 +57,14 @@ function cleanText(s) {
     .trim();
 }
 
+// Google News descriptions are very often just a list of "<a href=...>Source
+// name</a>" links ("Also covered by...") rather than real article content.
+// Detect and skip these instead of showing a garbled run-on of outlet names.
+function isLinkListJunk(raw) {
+  const linkCount = (raw.match(/<a\s/gi) || []).length;
+  return linkCount >= 2;
+}
+
 function parseRss(xml) {
   const items = [];
   const itemRegex = /<item[^>]*>([\s\S]*?)<\/item>/g;
@@ -66,7 +74,8 @@ function parseRss(xml) {
     let title = cleanText(extractTag(block, 'title'));
     const link = cleanText(extractTag(block, 'link'));
     const pubDate = extractTag(block, 'pubDate');
-    const description = cleanText(extractTag(block, 'description'));
+    const descRaw = extractTag(block, 'description');
+    const description = isLinkListJunk(descRaw) ? '' : cleanText(descRaw);
     let source = cleanText(extractTag(block, 'source') || extractTag(block, 'author'));
     if (!source && title.includes(' - ')) {
       const parts = title.split(' - ');
@@ -105,11 +114,18 @@ async function translateOne(text) {
 }
 
 // ---------- Fetch + parse + translate from a list of candidate sources,
-// preferring the first one that actually has images ----------
+// preferring whichever one actually has images and real descriptions ----------
+function scoreNewsItems(parsed) {
+  if (!parsed.length) return 0;
+  const withImage = parsed.filter((it) => it.image).length;
+  const withDesc = parsed.filter((it) => it.description).length;
+  return withImage / parsed.length + withDesc / parsed.length; // 0..2
+}
+
 async function fetchAndTranslate(sources, maxItems) {
   let items = [];
   let usedSource = null;
-  let fallback = null;
+  let best = null;
 
   for (const src of sources) {
     try {
@@ -118,15 +134,15 @@ async function fetchAndTranslate(sources, maxItems) {
       const xml = await res.text();
       const parsed = parseRss(xml);
       if (parsed.length) {
-        const hasImages = parsed.some((it) => it.image);
-        if (hasImages) { items = parsed.slice(0, maxItems); usedSource = src.name; break; }
-        if (!fallback) fallback = { items: parsed.slice(0, maxItems), name: src.name };
+        const score = scoreNewsItems(parsed);
+        if (!best || score > best.score) best = { items: parsed.slice(0, maxItems), name: src.name, score };
+        if (score >= 1.8) break; // great source — good enough, stop here
       }
     } catch (e) {
       console.log(`  ${src.name} failed: ${e.message}`);
     }
   }
-  if (!items.length && fallback) { items = fallback.items; usedSource = fallback.name; }
+  if (best) { items = best.items; usedSource = best.name; }
   if (!items.length) return null;
 
   await Promise.all(
